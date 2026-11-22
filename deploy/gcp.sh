@@ -7,6 +7,8 @@
 #               OTP_DEV_MODE (true = login codes shown on screen; set false once SMS is set up).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# private values (PROJECT_ID, MONGO_URI, ...) can live in deploy/.env.deploy, which git ignores
+if [ -f deploy/.env.deploy ]; then set -a; . deploy/.env.deploy; set +a; fi
 
 : "${PROJECT_ID:?Set PROJECT_ID (your GCP project ID)}"
 REGION="${REGION:-asia-south1}"
