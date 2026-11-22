@@ -1,9 +1,10 @@
 import { Business } from "../models/index.js";
 import { notify } from "./notify.js";
 
-/* Background jobs, run in-process every few minutes.
+/* Background jobs. Locally they run in-process every 5 minutes. On Cloud Run (which pauses idle
+   instances) Cloud Scheduler calls POST /internal/jobs instead, guarded by JOBS_SECRET.
    Opening alerts: "opens tomorrow" reminder, then "open now" on the day (and flip status). */
-async function openingAlerts() {
+export async function openingAlerts() {
   const now = new Date();
   const tomorrow = new Date(now.getTime() + 24 * 3_600_000);
 

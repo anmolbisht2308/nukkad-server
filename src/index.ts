@@ -5,7 +5,8 @@ import morgan from "morgan";
 import mongoose from "mongoose";
 import { config } from "./config.js";
 import { errorHandler } from "./lib/http.js";
-import { startJobs } from "./lib/jobs.js";
+import { openingAlerts, startJobs } from "./lib/jobs.js";
+import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import auth from "./routes/auth.js";
 import pub from "./routes/public.js";
@@ -17,6 +18,7 @@ import social from "./routes/social.js";
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", true); // behind Cloud Run / load balancer
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } })); // lets the web app show uploaded photos
 app.use(cors({ origin: config.webOrigin }));
 const smallJson = express.json({ limit: "100kb" });
@@ -27,6 +29,17 @@ app.use(morgan(config.isProd ? "combined" : "dev"));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, db: mongoose.connection.readyState === 1 });
+});
+/** Cloud Scheduler hits this every 5 minutes in production. */
+app.post("/internal/jobs", async (req, res) => {
+  const given = Buffer.from(req.get("x-jobs-secret") ?? "");
+  const want = Buffer.from(config.jobsSecret ?? "");
+  if (!config.jobsSecret || given.length !== want.length || !timingSafeEqual(given, want)) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+  await openingAlerts();
+  res.json({ ok: true });
 });
 app.use("/api/auth", auth);
 app.use("/api/merchant", merchant);
@@ -42,5 +55,5 @@ app.use(errorHandler);
 
 await mongoose.connect(config.mongoUri);
 await mongoose.syncIndexes();
-startJobs();
+if (!config.onCloudRun) startJobs();
 app.listen(config.port, () => console.log(`API ready on http://localhost:${config.port}`));

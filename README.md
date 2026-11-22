@@ -32,15 +32,27 @@ Demo logins: merchant `9999999999` · organiser `9888888888` · admin `900000000
 | `/api/host` | Tournaments (knockout + league), fixtures, scores, event stall grids |
 | `/api` (social) | Cities, notifications, points & leaderboard, creators, campaigns |
 
-Background jobs (in-process, every 5 min): opening-tomorrow reminders and flipping openings to "open now".
+Background jobs (every 5 min): opening-tomorrow reminders and flipping openings to "open now". Locally they run in-process; on Cloud Run, Cloud Scheduler calls `POST /internal/jobs` (guarded by `JOBS_SECRET`).
+
+## Deploy to Google Cloud Run
+
+Needs: a GCP project with billing (free trial is fine), the `gcloud` CLI logged in, and a MongoDB Atlas connection string (Network Access must allow `0.0.0.0/0`, since Cloud Run has no fixed IP).
+
+```bash
+PROJECT_ID=your-project-id MONGO_URI='mongodb+srv://user:pass@cluster.mongodb.net/nukkad' ./deploy/gcp.sh
+```
+
+It enables the APIs, creates a runtime service account, stores `MONGO_URI` / `JWT_SECRET` / `JOBS_SECRET` in Secret Manager, creates a public photo bucket, builds this Dockerfile with Cloud Build, deploys to Cloud Run in Mumbai (`asia-south1`), and schedules the jobs. Re-run it to redeploy. Once the frontend is live, re-run with `WEB_ORIGIN=https://your-frontend-url` so the browser may call the API.
+
+To load demo data into Atlas: `MONGO_URI='mongodb+srv://…' npx tsx src/seed.ts` (wipes that database).
 
 ## Production — still needed
 
 - **SMS OTP:** `OTP_DEV_MODE=false` + `MSG91_AUTH_KEY` / `MSG91_TEMPLATE_ID` (`src/lib/sms.ts`, untested against MSG91).
 - **Payments:** `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` (`src/lib/payments.ts`, untested against Razorpay). Refunds are only flagged (`refund_due`); venue payouts not built.
 - **Push / WhatsApp** delivery of notifications (in-app only; hook in `src/lib/notify.ts`).
-- **Photo storage:** uploads go to `uploads/`; move to S3/R2.
-- Set a strong `JWT_SECRET` and `WEB_ORIGIN` to the frontend URL.
+- **Photos:** stored in Cloud Storage when `GCS_BUCKET` is set (the deploy script does this), `uploads/` locally.
+- **`OTP_DEV_MODE` is `true` by default in the deploy, so login codes are shown on screen and anyone can log in as any number. Fine for a private demo; set `OTP_DEV_MODE=false` once SMS works.**
 
 ```bash
 npm run build && npm start

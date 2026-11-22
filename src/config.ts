@@ -11,6 +11,9 @@ export const config = {
   webOrigin: (process.env.WEB_ORIGIN ?? "http://localhost:3200").split(","),
   otpDevMode: process.env.OTP_DEV_MODE !== "false",
   isProd: process.env.NODE_ENV === "production",
+  /** Cloud Run sets K_SERVICE; there the scheduler drives jobs instead of setInterval. */
+  onCloudRun: !!process.env.K_SERVICE,
+  jobsSecret: process.env.JOBS_SECRET,
 };
 
 if (config.isProd && config.jwtSecret === "dev-secret") throw new Error("Set JWT_SECRET in production");

@@ -5,8 +5,7 @@ import { requireAuth, requireRole } from "../middleware/auth.js";
 import { Business, Claim, Deal, User } from "../models/index.js";
 import { notify } from "../lib/notify.js";
 import { award, POINTS } from "../lib/points.js";
-import { writeFile } from "node:fs/promises";
-import path from "node:path";
+import { savePublicFile } from "../lib/storage.js";
 
 const followersOf = async (businessId: unknown) => {
   const filter: Record<string, unknown> = { follows: businessId };
@@ -96,7 +95,7 @@ r.get("/businesses/:id/stats", async (req, res) => {
   });
 });
 
-/** Cover photo, sent as a base64 data URL (≤3 MB). Stored on local disk; swap for S3/R2 in production. */
+/** Cover photo, sent as a base64 data URL (≤3 MB). Cloud Storage in production, ./uploads locally. */
 r.post("/businesses/:id/photo", body(z.object({ dataUrl: z.string().max(4_200_000) })), async (req, res) => {
   const b = await owned(String(req.params.id), req.user!.id, req.user!.role);
   const m = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(req.body.dataUrl);
@@ -104,8 +103,7 @@ r.post("/businesses/:id/photo", body(z.object({ dataUrl: z.string().max(4_200_00
   const buf = Buffer.from(m[2], "base64");
   if (buf.length > 3_000_000) throw new HttpError(413, "Image must be under 3 MB");
   const file = `${b._id}-${Date.now()}.${m[1] === "jpeg" ? "jpg" : m[1]}`;
-  await writeFile(path.resolve("uploads", file), buf);
-  b.set("photo", `/uploads/${file}`);
+  b.set("photo", await savePublicFile(file, buf, `image/${m[1]}`));
   await b.save();
   res.json({ photo: b.photo });
 });
