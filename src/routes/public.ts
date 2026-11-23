@@ -123,6 +123,14 @@ r.post("/deals/:id/claim", requireAuth, async (req, res) => {
     res.status(201).json({ claim });
   } catch (e) {
     await Deal.updateOne({ _id: deal._id }, { $inc: { claimedCount: -1 } });
+    // a double tap raced us to it: hand back the coupon the other request created
+    if ((e as { code?: number }).code === 11000) {
+      const mine = await Claim.findOne({ deal: deal._id, user: req.user!.id }).lean();
+      if (mine) {
+        res.json({ claim: mine });
+        return;
+      }
+    }
     throw e;
   }
 });
@@ -159,7 +167,10 @@ r.post("/events/:slug/rsvp", requireAuth, async (req, res) => {
     return;
   }
   const left = await Event.updateOne({ slug: req.params.slug, attendees: uid }, { $pull: { attendees: uid }, $inc: { rsvpCount: -1 } });
-  if (!left.modifiedCount) throw new HttpError(409, "This event is full");
+  if (!left.modifiedCount) {
+    if (!(await Event.exists({ slug: req.params.slug }))) throw notFound("Event not found");
+    throw new HttpError(409, "This event is full");
+  }
   res.json({ going: false });
 });
 

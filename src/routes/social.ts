@@ -146,8 +146,11 @@ const loadForCreator = async (id: string, userId: string) => {
 r.post("/campaigns/:id/respond", requireAuth, body(z.object({ accept: z.boolean() })), async (req, res) => {
   const c = await loadForCreator(String(req.params.id), req.user!.id);
   if (c.status !== "requested") throw new HttpError(409, "Already answered");
-  c.status = req.body.accept ? "accepted" : "declined";
-  await c.save();
+  // conditional write so an accept and a decline sent together can't both win
+  const status = req.body.accept ? "accepted" : "declined";
+  const answered = await Campaign.updateOne({ _id: c._id, status: "requested" }, { $set: { status } });
+  if (!answered.modifiedCount) throw new HttpError(409, "Already answered");
+  c.status = status;
   if (req.body.accept) await Deal.updateOne({ _id: c.deal }, { $set: { active: true, startsAt: new Date() } });
   await notify([c.business.owner as string], {
     type: "campaign",
@@ -161,9 +164,10 @@ r.post("/campaigns/:id/respond", requireAuth, body(z.object({ accept: z.boolean(
 r.post("/campaigns/:id/posted", requireAuth, body(z.object({ postUrl: z.string().url().max(300) })), async (req, res) => {
   const c = await loadForCreator(String(req.params.id), req.user!.id);
   if (c.status !== "accepted") throw new HttpError(409, "Accept the campaign first");
+  const posted = await Campaign.updateOne({ _id: c._id, status: "accepted" }, { $set: { status: "posted", postUrl: req.body.postUrl } });
+  if (!posted.modifiedCount) throw new HttpError(409, "Already marked as posted");
   c.status = "posted";
   c.postUrl = req.body.postUrl;
-  await c.save();
   await notify([c.business.owner as string], { type: "campaign", emoji: "📸", title: `@${c.creator.handle} posted about ${c.business.name}`, link: "/merchant" });
   res.json({ campaign: c });
 });
@@ -173,8 +177,10 @@ r.post("/campaigns/:id/complete", requireAuth, requireRole("merchant", "admin"),
   if (!c) throw notFound("Campaign not found");
   if (req.user!.role !== "admin" && String(c.business.owner) !== req.user!.id) throw new HttpError(403, "Not your campaign");
   if (c.status !== "posted") throw new HttpError(409, "The creator hasn't posted yet");
+  // conditional write so a double click can't count the campaign (and the payout notice) twice
+  const done = await Campaign.updateOne({ _id: c._id, status: "posted" }, { $set: { status: "completed" } });
+  if (!done.modifiedCount) throw new HttpError(409, "Already marked complete");
   c.status = "completed";
-  await c.save();
   const cr = await Creator.findByIdAndUpdate(c.creator, { $inc: { completed: 1 } });
   if (cr) await notify([cr.user], { type: "campaign", emoji: "✅", title: "Campaign marked complete", body: `₹${c.budget} payout is on its way`, link: "/creator" });
   res.json({ campaign: c });

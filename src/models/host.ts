@@ -6,7 +6,7 @@ const paymentSub = new Schema(
   {
     orderId: String,
     provider: { type: String, enum: ["mock", "razorpay"] },
-    status: { type: String, enum: ["none", "pending", "paid"], default: "none" },
+    status: { type: String, enum: ["none", "pending", "processing", "paid", "refund_due"], default: "none" },
   },
   { _id: false }
 );

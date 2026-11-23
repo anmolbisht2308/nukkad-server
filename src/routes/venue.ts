@@ -60,6 +60,8 @@ r.get("/courts", async (req, res) => {
 
 r.post("/courts", body(courtBody.partial({ active: true, peakFrom: true, peakTo: true, openHour: true, closeHour: true }).extend({ business: z.string() })), async (req, res) => {
   const id = await ownVenue(req.user!, req.body.business);
+  if (req.body.openHour !== undefined && req.body.closeHour !== undefined && req.body.closeHour <= req.body.openHour)
+    throw new HttpError(400, "Closing hour must be after opening hour");
   const court = await Court.create({ ...req.body, business: id });
   res.status(201).json({ court });
 });

@@ -91,11 +91,13 @@ export async function buildKnockout(t: { _id: Types.ObjectId; startsAt: Date }, 
     );
     created.unshift(docs.map((d) => ({ _id: d._id, round, order: d.order })));
   }
-  // round 1: seeds 1..n; byes go to the top seeds (teamB empty)
-  const half = size / 2;
-  for (let o = 0; o < half; o++) {
-    const a = teamIds[o];
-    const b = teamIds[half + o];
+  // round 1 in standard bracket order (1v8, 4v5, 2v7, 3v6 …): byes go to the top seeds,
+  // and seeds 1 and 2 can only meet in the final. The lower seed index is always slot A.
+  const order = (n: number): number[] => (n === 1 ? [0] : order(n / 2).flatMap((i) => [i, n - 1 - i]));
+  const pos = order(size);
+  for (let o = 0; o < size / 2; o++) {
+    const a = teamIds[pos[2 * o]];
+    const b = teamIds[pos[2 * o + 1]];
     const m = await Match.findById(created[0][o]._id);
     if (!m) continue;
     m.set({ teamA: a, teamB: b });
@@ -138,8 +140,10 @@ export async function advance(matchId: Types.ObjectId) {
   if (!m?.nextMatch || !m.winner) return;
   const next = await Match.findById(m.nextMatch);
   if (!next) return;
+  const slot = m.nextSlot === "A" ? "teamA" : "teamB";
+  if (String(next.get(slot)) === String(m.winner)) return; // same winner as before: nothing to move
   if (next.status === "done" && !next.bye) throw new HttpError(409, "The next round is already played; edit that match first");
-  next.set(m.nextSlot === "A" ? "teamA" : "teamB", m.winner);
+  next.set(slot, m.winner);
   await next.save();
 }
 
@@ -154,8 +158,10 @@ async function completeIfFinished(tournamentId: Types.ObjectId) {
     champion = final?.winner ?? undefined;
   } else {
     const teams = await Team.find({ tournament: t._id, paid: true }, "name").lean();
-    const top = standings(teams, matches)[0];
-    champion = top ? (teams.find((x) => String(x._id) === top.team)?._id ?? undefined) : undefined;
+    const [top, second] = standings(teams, matches);
+    const deadLevel = !!second && top.pts === second.pts && top.diff === second.diff && top.pf === second.pf;
+    // a full tie is left for the organiser to settle (play-off), not decided by team name
+    champion = top && !deadLevel ? (teams.find((x) => String(x._id) === top.team)?._id ?? undefined) : undefined;
   }
   t.set({ status: "completed", champion });
   await t.save();
@@ -214,7 +220,7 @@ r.post(
   async (req, res) => {
     const t = await Tournament.findOne({ slug: req.params.slug });
     if (!t) throw notFound("Tournament not found");
-    if (t.status !== "registration") throw new HttpError(409, "Registrations are closed");
+    if (t.status !== "registration" || (await Match.exists({ tournament: t._id }))) throw new HttpError(409, "Registrations are closed");
     if (t.teamsCount >= t.maxTeams) throw new HttpError(409, "All team spots are taken");
     if (req.body.players.length < t.teamSize) throw new HttpError(400, `Add at least ${t.teamSize} players`);
 
@@ -230,9 +236,20 @@ r.post(
       res.status(201).json({ team: { _id: team._id, name: team.name, paid: false }, order });
       return;
     }
-    team.set({ paid: true, seed: t.teamsCount + 1, payment: { status: "none" } });
-    await team.save();
-    await Tournament.updateOne({ _id: t._id }, { $inc: { teamsCount: 1 } });
+    // take a spot atomically so two captains signing up at once can't overfill it
+    const spot = await Tournament.findOneAndUpdate(
+      { _id: t._id, status: "registration", $expr: { $lt: ["$teamsCount", "$maxTeams"] } },
+      { $inc: { teamsCount: 1 } },
+      { returnDocument: "after" }
+    );
+    if (!spot) throw new HttpError(409, "All team spots are taken");
+    team.set({ paid: true, seed: spot.teamsCount, payment: { status: "none" } });
+    try {
+      await team.save();
+    } catch (e) {
+      await Tournament.updateOne({ _id: t._id }, { $inc: { teamsCount: -1 } });
+      throw e;
+    }
     await award(req.user!.id, POINTS.tournament, `Registered ${team.name} for ${t.title}`, `tournament:${team._id}`);
     await notify([req.user!.id], { type: "tournament", emoji: t.emoji, title: `${team.name} is in!`, body: `You're registered for ${t.title}.`, link: `/tournaments/${t.slug}` });
     res.status(201).json({ team: { _id: team._id, name: team.name, paid: true } });
@@ -250,13 +267,32 @@ r.post("/tournaments/:slug/teams/:id/confirm", requireAuth, body(z.object({ proo
   }
   const proof = req.body.proof;
   if (proof.orderId !== team.payment?.orderId || !verifyPayment(proof)) throw new HttpError(402, "Payment could not be verified");
-  // atomically take a spot so we never exceed maxTeams
-  const spot = await Tournament.findOneAndUpdate(
-    { _id: t._id, status: "registration", $expr: { $lt: ["$teamsCount", "$maxTeams"] } },
-    { $inc: { teamsCount: 1 } },
-    { returnDocument: "after" }
+  // claim this payment exactly once, so a double tap or retry can't take two spots
+  const claimed = await Team.findOneAndUpdate(
+    { _id: team._id, paid: false, "payment.orderId": proof.orderId, "payment.status": "pending" },
+    { $set: { "payment.status": "processing" } }
   );
-  if (!spot) throw new HttpError(409, "The tournament filled up before your payment finished. Contact the organiser for a refund.");
+  if (!claimed) {
+    const now = await Team.findById(team._id, "paid").lean();
+    if (now?.paid) {
+      res.json({ team: { _id: team._id, name: team.name, paid: true } });
+      return;
+    }
+    throw new HttpError(409, "Your payment is already being processed");
+  }
+  // atomically take a spot so we never exceed maxTeams
+  const closed = !!(await Match.exists({ tournament: t._id }));
+  const spot = closed
+    ? null
+    : await Tournament.findOneAndUpdate(
+        { _id: t._id, status: "registration", $expr: { $lt: ["$teamsCount", "$maxTeams"] } },
+        { $inc: { teamsCount: 1 } },
+        { returnDocument: "after" }
+      );
+  if (!spot) {
+    await Team.updateOne({ _id: team._id }, { $set: { "payment.status": "refund_due" } });
+    throw new HttpError(409, "Registrations closed before your payment finished. Contact the organiser for a refund.");
+  }
   team.set({ paid: true, seed: spot.teamsCount, payment: { orderId: proof.orderId, provider: proof.provider, status: "paid" } });
   await team.save();
   await award(req.user!.id, POINTS.tournament, `Registered ${team.name} for ${t.title}`, `tournament:${team._id}`);
@@ -284,7 +320,7 @@ r.post(
       title: z.string().trim().min(3).max(80),
       sport: z.string().trim().min(2).max(30),
       format: z.enum(["knockout", "league"]),
-      startsAt: z.coerce.date(),
+      startsAt: z.coerce.date().refine((d) => d.getTime() > Date.now(), "Pick a start time in the future"),
       entryFee: z.number().min(0).max(100000).default(0),
       teamSize: z.number().int().min(1).max(15).default(6),
       maxTeams: z.number().int().min(2).max(64).default(8),
@@ -302,21 +338,32 @@ r.post(
       venue = await Business.findOne({ _id: venueId, kind: "sports_venue" }, "name area city").lean();
       if (!venue) throw new HttpError(400, "Venue not found");
     }
-    let slug = slugify(b.title);
-    if (await Tournament.exists({ slug })) slug = `${slug}-${Date.now().toString(36).slice(-4)}`;
+    const base = slugify(b.title);
     const look = sportLook(b.sport);
-    const t = await Tournament.create({
-      ...b,
-      sport: b.sport.toLowerCase(),
-      slug,
-      organizer: req.user!.id,
-      venue: venue?._id,
-      venueName: b.venueName ?? venue?.name,
-      area: b.area ?? venue?.area,
-      city: venue?.city ?? "bareilly",
-      emoji: look.emoji,
-      theme: { from: look.from, to: look.to },
-    });
+    const create = (slug: string) =>
+      Tournament.create({
+        ...b,
+        sport: b.sport.toLowerCase(),
+        slug,
+        organizer: req.user!.id,
+        venue: venue?._id,
+        venueName: b.venueName ?? venue?.name,
+        area: b.area ?? venue?.area,
+        city: venue?.city ?? "bareilly",
+        emoji: look.emoji,
+        theme: { from: look.from, to: look.to },
+      });
+    // same title as another tournament (even one created this instant): add a short suffix and retry
+    let t;
+    for (let attempt = 0; ; attempt++) {
+      const slug = attempt === 0 ? base : `${base}-${Math.random().toString(36).slice(2, 6)}`;
+      try {
+        t = await create(slug);
+        break;
+      } catch (e) {
+        if ((e as { code?: number }).code !== 11000 || attempt >= 4) throw e;
+      }
+    }
     res.status(201).json({ tournament: t });
   }
 );
@@ -361,6 +408,8 @@ r.post(
     }
     m.set({ scoreA, scoreB, status, winner: winner ?? null });
     await m.save();
+    // a corrected result after the end: reopen so the champion is worked out again below
+    if (t.status === "completed") await Tournament.updateOne({ _id: t._id }, { $set: { status: "live" }, $unset: { champion: 1 } });
 
     if (t.status === "registration" && status !== "scheduled") await Tournament.updateOne({ _id: t._id }, { status: "live" });
     if (t.format === "knockout") {
@@ -383,6 +432,13 @@ r.post(
 
 r.post("/tournaments/:slug/status", requireAuth, requireRole(...ORGANISER_ROLES), body(z.object({ status: z.enum(["registration", "live", "completed"]) })), async (req, res) => {
   const t = await ownedTournament(String(req.params.slug), req.user!);
+  const allowed: Record<string, string[]> = { registration: ["live"], live: ["registration", "completed"], completed: ["live"] };
+  if (req.body.status !== t.status && !allowed[t.status]?.includes(req.body.status))
+    throw new HttpError(409, `Can't move a tournament from ${t.status} to ${req.body.status}`);
+  if (req.body.status === "registration" && (await Match.exists({ tournament: t._id, status: { $ne: "scheduled" }, bye: { $ne: true } })))
+    throw new HttpError(409, "Matches have started; registrations can't reopen");
+  if (req.body.status === "completed" && (await Match.exists({ tournament: t._id, status: { $ne: "done" } })))
+    throw new HttpError(409, "Finish every match first; the tournament completes itself after the last result");
   t.set("status", req.body.status);
   await t.save();
   res.json({ tournament: t as unknown as TournamentLean });
@@ -421,7 +477,8 @@ r.get("/events/:slug/stalls", async (req, res) => {
 r.post(
   "/events/:slug/stalls",
   requireAuth,
-  requireRole("organizer", "admin"),
+  // Events have no owner account yet (organizer is a display name), so only Nukkad admins may lay out stalls.
+  requireRole("admin"),
   body(z.object({ rows: z.number().int().min(1).max(8), cols: z.number().int().min(1).max(12), price: z.number().min(0).max(100000), size: z.enum(["small", "large"]).default("small") })),
   async (req, res) => {
     const e = await Event.findOne({ slug: req.params.slug }, "_id").lean();
@@ -445,10 +502,7 @@ r.post("/stalls/:id/book", requireAuth, requireRole("merchant", "admin"), body(z
   if (!stall) throw notFound("Stall not found");
   await releaseExpiredHolds(stall.event as Types.ObjectId);
   const dupe = await Stall.findOne({ event: stall.event, business: biz._id, status: { $in: ["held", "booked"] } }, "label status").lean();
-  if (dupe) {
-    if (dupe.status === "booked") throw new HttpError(409, `${biz.name} already has stall ${dupe.label}`);
-    await Stall.updateOne({ _id: dupe._id }, { $set: { status: "available", payment: { status: "none" } }, $unset: { business: 1, bookedBy: 1, heldUntil: 1 } });
-  }
+  if (dupe?.status === "booked") throw new HttpError(409, `${biz.name} already has stall ${dupe.label}`);
   const paid = stall.price > 0;
   const taken = await Stall.findOneAndUpdate(
     { _id: stall._id, status: "available" },
@@ -456,6 +510,9 @@ r.post("/stalls/:id/book", requireAuth, requireRole("merchant", "admin"), body(z
     { returnDocument: "after" }
   );
   if (!taken) throw new HttpError(409, "Someone just took this stall, pick another");
+  // switching stalls: let go of the old hold only now that the new one is secured
+  if (dupe && String(dupe._id) !== String(taken._id))
+    await Stall.updateOne({ _id: dupe._id, status: "held" }, { $set: { status: "available", payment: { status: "none" } }, $unset: { business: 1, bookedBy: 1, heldUntil: 1 } });
   if (!paid) {
     res.json({ stall: taken });
     return;
@@ -467,17 +524,22 @@ r.post("/stalls/:id/book", requireAuth, requireRole("merchant", "admin"), body(z
 });
 
 r.post("/stalls/:id/confirm", requireAuth, body(z.object({ proof: proofSchema })), async (req, res) => {
-  const stall = await Stall.findOne({ _id: req.params.id, bookedBy: req.user!.id });
-  if (!stall) throw notFound("Stall not found");
-  if (stall.status === "booked") {
-    res.json({ stall });
+  const current = await Stall.findById(req.params.id);
+  if (!current) throw notFound("Stall not found");
+  if (String(current.bookedBy) !== req.user!.id) throw new HttpError(410, "Your hold expired, book the stall again");
+  if (current.status === "booked") {
+    res.json({ stall: current });
     return;
   }
-  if (stall.status !== "held") throw new HttpError(410, "Your hold expired, book the stall again");
   const proof = req.body.proof;
-  if (proof.orderId !== stall.payment?.orderId || !verifyPayment(proof)) throw new HttpError(402, "Payment could not be verified");
-  stall.set({ status: "booked", heldUntil: undefined, payment: { orderId: proof.orderId, provider: proof.provider, status: "paid" } });
-  await stall.save();
+  if (proof.orderId !== current.payment?.orderId || !verifyPayment(proof)) throw new HttpError(402, "Payment could not be verified");
+  // one conditional write: only succeeds if this user's hold on this order is still in place
+  const stall = await Stall.findOneAndUpdate(
+    { _id: current._id, bookedBy: req.user!.id, status: "held", "payment.orderId": proof.orderId },
+    { $set: { status: "booked", payment: { orderId: proof.orderId, provider: proof.provider, status: "paid" } }, $unset: { heldUntil: 1 } },
+    { returnDocument: "after" }
+  );
+  if (!stall) throw new HttpError(410, "Your hold expired, book the stall again");
   const e = await Event.findById(stall.event, "title slug").lean();
   await notify([req.user!.id], { type: "stall", emoji: "🚚", title: `Stall ${stall.label} is yours`, body: e?.title, link: e ? `/events/${e.slug}` : undefined });
   res.json({ stall });
